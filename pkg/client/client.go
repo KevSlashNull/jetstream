@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/goccy/go-json"
@@ -141,48 +142,53 @@ func (c *Client) readLoop(ctx context.Context) error {
 	bytesRead := bytesRead.WithLabelValues(c.config.WebsocketURL)
 	eventsRead := eventsRead.WithLabelValues(c.config.WebsocketURL)
 
-	for {
+	go func() {
 		select {
 		case <-ctx.Done():
+			_ = c.con.SetReadDeadline(time.Now())
 			c.logger.Info("shutting down read loop on context completion")
-			return nil
 		case s := <-c.shutdown:
+			_ = c.con.SetReadDeadline(time.Now())
 			c.logger.Info("shutting down read loop on shutdown signal")
 			s <- struct{}{}
-			return nil
-		default:
-			_, msg, err := c.con.ReadMessage()
+		}
+	}()
+
+	for {
+		_, msg, err := c.con.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			c.logger.Error("failed to read message from websocket", "error", err)
+			return fmt.Errorf("failed to read message from websocket: %w", err)
+		}
+
+		bytesRead.Add(float64(len(msg)))
+		eventsRead.Inc()
+		c.BytesRead.Add(int64(len(msg)))
+		c.EventsRead.Inc()
+
+		// Decompress the message if necessary
+		if c.decoder != nil && c.config.Compress {
+			m, err := c.decoder.DecodeAll(msg, nil)
 			if err != nil {
-				c.logger.Error("failed to read message from websocket", "error", err)
-				return fmt.Errorf("failed to read message from websocket: %w", err)
+				c.logger.Error("failed to decompress message", "error", err)
+				return fmt.Errorf("failed to decompress message: %w", err)
 			}
+			msg = m
+		}
 
-			bytesRead.Add(float64(len(msg)))
-			eventsRead.Inc()
-			c.BytesRead.Add(int64(len(msg)))
-			c.EventsRead.Inc()
+		// Unpack the message and pass it to the handler
+		var event models.Event
+		if err := json.Unmarshal(msg, &event); err != nil {
+			c.logger.Error("failed to unmarshal event", "error", err)
+			return fmt.Errorf("failed to unmarshal event: %w", err)
+		}
 
-			// Decompress the message if necessary
-			if c.decoder != nil && c.config.Compress {
-				m, err := c.decoder.DecodeAll(msg, nil)
-				if err != nil {
-					c.logger.Error("failed to decompress message", "error", err)
-					return fmt.Errorf("failed to decompress message: %w", err)
-				}
-				msg = m
-			}
-
-			// Unpack the message and pass it to the handler
-			var event models.Event
-			if err := json.Unmarshal(msg, &event); err != nil {
-				c.logger.Error("failed to unmarshal event", "error", err)
-				return fmt.Errorf("failed to unmarshal event: %w", err)
-			}
-
-			if err := c.Scheduler.AddWork(ctx, event.Did, &event); err != nil {
-				c.logger.Error("failed to add work to scheduler", "error", err)
-				return fmt.Errorf("failed to add work to scheduler: %w", err)
-			}
+		if err := c.Scheduler.AddWork(ctx, event.Did, &event); err != nil {
+			c.logger.Error("failed to add work to scheduler", "error", err)
+			return fmt.Errorf("failed to add work to scheduler: %w", err)
 		}
 	}
 }
